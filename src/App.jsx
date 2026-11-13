@@ -11,7 +11,6 @@ const BALLS = [
   { name: 'Black', points: 7, color: 'bg-zinc-900 hover:bg-zinc-800 text-white border-zinc-600' },
 ];
 
-// ฟังก์ชันสุ่มรหัสห้อง 4 ตัวอักษร (เช่น X9B4)
 const generateRoomCode = () => {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -26,11 +25,20 @@ export default function App() {
   const [joinCode, setJoinCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
-  const [isSpectator, setIsSpectator] = useState(false); // โหมดดูอย่างเดียว ป้องกันมือลั่น
+  const [isSpectator, setIsSpectator] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  // ตรวจสอบ URL ว่ามี ?room=XXXX ติดมาด้วยไหม (กรณีเพื่อนส่งลิงก์มาให้)
+  // State ใหม่สำหรับ Event Log, Manual Score และ Match History
+  const [events, setEvents] = useState([]);
+  const [showManualModal, setShowManualModal] = useState(false);
+  const [manualP1, setManualP1] = useState(0);
+  const [manualP2, setManualP2] = useState(0);
+  const [matchHistory, setMatchHistory] = useState([]);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+
+  // โหลด Match History ตอนเปิดหน้าแรก
   useEffect(() => {
+    fetchMatchHistory();
     const params = new URLSearchParams(window.location.search);
     const codeFromUrl = params.get('room');
     if (codeFromUrl) {
@@ -38,24 +46,42 @@ export default function App() {
     }
   }, []);
 
-  // เชื่อมต่อ Supabase Real-time เมื่อเข้าห้องแล้ว
+  const fetchMatchHistory = async () => {
+    const { data } = await supabase
+      .from('matches')
+      .select('*')
+      .order('finished_at', { ascending: false })
+      .limit(20);
+    if (data) setMatchHistory(data);
+  };
+
+  // ดึงประวัติ Event Log ของห้องปัจจุบัน
+  const fetchRoomEvents = async (roomId) => {
+    const { data } = await supabase
+      .from('score_events')
+      .select('*')
+      .eq('room_id', roomId)
+      .order('created_at', { ascending: false })
+      .limit(15);
+    if (data) setEvents(data);
+  };
+
+  // เชื่อมต่อ Real-time ทั้งตาราง rooms และ score_events
   useEffect(() => {
     if (!room?.id) return;
+    fetchRoomEvents(room.id);
 
     const channel = supabase
-      .channel(`room_${room.id}`)
+      .channel(`room_full_${room.id}`)
       .on(
         'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'rooms',
-          filter: `id=eq.${room.id}`,
-        },
-        (payload) => {
-          // อัปเดตหน้าจอทันทีเมื่อข้อมูลใน Database เปลี่ยนแปลง
-          setRoom(payload.new);
-        }
+        { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${room.id}` },
+        (payload) => setRoom(payload.new)
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'score_events', filter: `room_id=eq.${room.id}` },
+        () => fetchRoomEvents(room.id)
       )
       .subscribe();
 
@@ -64,12 +90,10 @@ export default function App() {
     };
   }, [room?.id]);
 
-  // สร้างห้องใหม่
   const handleCreateRoom = async () => {
     setLoading(true);
     setErrorMsg('');
     const newCode = generateRoomCode();
-
     const { data, error } = await supabase
       .from('rooms')
       .insert([{ room_code: newCode }])
@@ -81,19 +105,16 @@ export default function App() {
       setErrorMsg('สร้างห้องไม่สำเร็จ: ' + error.message);
       return;
     }
-
     setRoom(data);
     window.history.pushState({}, '', `?room=${data.room_code}`);
   };
 
-  // เข้าร่วมห้องที่มีอยู่
   const handleJoinRoom = async (codeToJoin) => {
     const targetCode = (codeToJoin || joinCode).trim().toUpperCase();
     if (!targetCode) return;
 
     setLoading(true);
     setErrorMsg('');
-
     const { data, error } = await supabase
       .from('rooms')
       .select('*')
@@ -105,16 +126,13 @@ export default function App() {
       setErrorMsg('ไม่พบห้องรหัสนี้ กรุณาตรวจสอบอีกครั้ง');
       return;
     }
-
     setRoom(data);
     window.history.pushState({}, '', `?room=${data.room_code}`);
   };
 
-  // ฟังก์ชันกลางสำหรับอัปเดตคะแนนขึ้น Cloud และเก็บประวัติ Undo
   const updateRoomState = async (newFields, actionType, ballName = null, points = 0) => {
     if (!room || isSpectator) return;
 
-    // เก็บค่าปัจจุบันไว้เผื่อกด Undo
     const prevState = {
       p1_score: room.p1_score,
       p2_score: room.p2_score,
@@ -125,10 +143,8 @@ export default function App() {
       reds_remaining: room.reds_remaining,
     };
 
-    // Optimistic UI: อัปเดตหน้าจอตัวเองทันทีให้ลื่นไหลไม่ต้องรอเน็ต
     setRoom((prev) => ({ ...prev, ...newFields }));
 
-    // บันทึกประวัติลง score_events
     await supabase.from('score_events').insert([
       {
         room_id: room.id,
@@ -140,11 +156,10 @@ export default function App() {
       },
     ]);
 
-    // อัปเดตข้อมูลหลักในตาราง rooms (จะไปกระตุ้น Realtime ให้เครื่องอื่นเห็นด้วย)
     await supabase.from('rooms').update(newFields).eq('id', room.id);
+    fetchRoomEvents(room.id);
   };
 
-  // กดลูกสี
   const handlePotBall = (ball) => {
     const isP1 = room.active_player === 1;
     const newReds =
@@ -165,18 +180,13 @@ export default function App() {
     );
   };
 
-  // สลับไม้แทง
   const handleSwitchTurn = () => {
     updateRoomState(
-      {
-        active_player: room.active_player === 1 ? 2 : 1,
-        current_break: 0,
-      },
+      { active_player: room.active_player === 1 ? 2 : 1, current_break: 0 },
       'SWITCH_TURN'
     );
   };
 
-  // กดฟาวล์
   const handleFoul = (foulPoints) => {
     const isP1 = room.active_player === 1;
     updateRoomState(
@@ -192,7 +202,6 @@ export default function App() {
     );
   };
 
-  // จบเฟรม
   const handleNextFrame = () => {
     if (room.p1_score === room.p2_score) {
       alert('คะแนนยังเสมอกันอยู่ กรุณาชิงดำก่อนจบเฟรม!');
@@ -213,50 +222,103 @@ export default function App() {
     );
   };
 
-  // ย้อนกลับ (Undo จาก Database)
-  const handleUndo = async () => {
-    if (!room || isSpectator) return;
-
-    // ดึงรายการล่าสุดของห้องนี้
-    const { data: events } = await supabase
-      .from('score_events')
-      .select('*')
-      .eq('room_id', room.id)
-      .order('created_at', { ascending: false })
-      .limit(1);
-
-    if (!events || events.length === 0) return;
-
-    const lastEvent = events[0];
-    // คืนค่าสถานะก่อนหน้า
-    setRoom((prev) => ({ ...prev, ...lastEvent.prev_state }));
-    await supabase.from('rooms').update(lastEvent.prev_state).eq('id', room.id);
-    // ลบประวัติรายการที่เพิ่ง Undo ทิ้ง
-    await supabase.from('score_events').delete().eq('id', lastEvent.id);
+  // เปิดหน้าต่าง Manual Score
+  const openManualScore = () => {
+    setManualP1(room.p1_score);
+    setManualP2(room.p2_score);
+    setShowManualModal(true);
   };
 
-  // เปลี่ยนชื่อผู้เล่น
+  // บันทึกคะแนน Manual Score
+  const handleSaveManualScore = () => {
+    updateRoomState(
+      { p1_score: Number(manualP1) || 0, p2_score: Number(manualP2) || 0 },
+      'MANUAL_ADJUST'
+    );
+    setShowManualModal(false);
+  };
+
+  // จบการแข่งขันและบันทึกลง Match History
+  const handleFinishMatch = async () => {
+    if (room.p1_frames === 0 && room.p2_frames === 0 && room.p1_score === 0 && room.p2_score === 0) {
+      alert('ยังไม่มีคะแนนการแข่งขัน ไม่สามารถบันทึกผลได้');
+      return;
+    }
+
+    // คำนวณเฟรมรวม (ถ้าเฟรมปัจจุบันมีคนนำอยู่ ให้บวกเฟรมสุดท้ายให้อัตโนมัติ)
+    let finalP1Frames = room.p1_frames;
+    let finalP2Frames = room.p2_frames;
+    if (room.p1_score > room.p2_score) finalP1Frames += 1;
+    else if (room.p2_score > room.p1_score) finalP2Frames += 1;
+
+    const winner =
+      finalP1Frames > finalP2Frames
+        ? room.p1_name
+        : finalP2Frames > finalP1Frames
+        ? room.p2_name
+        : 'เสมอ (Draw)';
+
+    if (!confirm(`ยืนยันจบการแข่งขัน?\n${room.p1_name} (${finalP1Frames}) - (${finalP2Frames}) ${room.p2_name}\nผู้ชนะ: ${winner}`)) {
+      return;
+    }
+
+    await supabase.from('matches').insert([
+      {
+        room_code: room.room_code,
+        p1_name: room.p1_name,
+        p2_name: room.p2_name,
+        p1_frames: finalP1Frames,
+        p2_frames: finalP2Frames,
+        winner_name: winner,
+      },
+    ]);
+
+    alert('บันทึกผลการแข่งขันลงประวัติเรียบร้อยแล้ว!');
+    fetchMatchHistory();
+    handleLeaveRoom();
+  };
+
+  const handleUndo = async () => {
+    if (!room || isSpectator || events.length === 0) return;
+    const lastEvent = events[0];
+    setRoom((prev) => ({ ...prev, ...lastEvent.prev_state }));
+    await supabase.from('rooms').update(lastEvent.prev_state).eq('id', room.id);
+    await supabase.from('score_events').delete().eq('id', lastEvent.id);
+    fetchRoomEvents(room.id);
+  };
+
   const handleNameChange = async (playerNum, newName) => {
     const field = playerNum === 1 ? { p1_name: newName } : { p2_name: newName };
     setRoom((prev) => ({ ...prev, ...field }));
     await supabase.from('rooms').update(field).eq('id', room.id);
   };
 
-  // คัดลอกลิงก์ห้องส่งให้เพื่อน
   const handleCopyLink = () => {
     navigator.clipboard.writeText(window.location.href);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // ออกจากห้องกลับหน้าแรก
   const handleLeaveRoom = () => {
     setRoom(null);
+    setEvents([]);
     window.history.pushState({}, '', '/');
   };
 
+  // แปลงข้อความ Event Log ให้เข้าใจง่าย
+  const formatEventText = (ev) => {
+    const playerName = ev.player === 1 ? room.p1_name : room.p2_name;
+    const otherPlayer = ev.player === 1 ? room.p2_name : room.p1_name;
+    if (ev.action_type === 'POT') return `🟢 ${playerName} แทงลง ${ev.ball_name} (+${ev.points})`;
+    if (ev.action_type === 'FOUL') return `⚠️ ${playerName} ฟาวล์ (${otherPlayer} ได้ +${ev.points})`;
+    if (ev.action_type === 'SWITCH_TURN') return `🔄 สลับไม้แทง`;
+    if (ev.action_type === 'NEXT_FRAME') return `🏆 จบเฟรม เริ่มเฟรมใหม่`;
+    if (ev.action_type === 'MANUAL_ADJUST') return `✏️ ปรับคะแนนด้วยตนเอง`;
+    return ev.action_type;
+  };
+
   // ==========================================
-  // หน้าจอที่ 1: Lobby (สร้างห้อง / เข้าห้อง)
+  // หน้าจอที่ 1: Lobby & Match History
   // ==========================================
   if (!room) {
     return (
@@ -270,7 +332,6 @@ export default function App() {
             ระบบบันทึกคะแนนสนุกเกอร์ออนไลน์ Real-time
           </p>
 
-          {/* ปุ่มสร้างห้องใหม่ */}
           <button
             onClick={handleCreateRoom}
             disabled={loading}
@@ -287,8 +348,7 @@ export default function App() {
             <div className="flex-grow border-t border-slate-800"></div>
           </div>
 
-          {/* ฟอร์มกรอกรหัสเข้าห้อง */}
-          <div className="flex gap-2">
+          <div className="flex gap-2 mb-6">
             <input
               type="text"
               maxLength={4}
@@ -306,18 +366,77 @@ export default function App() {
             </button>
           </div>
 
+          {/* ปุ่มเปิดดู Match History */}
+          <button
+            onClick={() => {
+              fetchMatchHistory();
+              setShowHistoryModal(true);
+            }}
+            className="w-full bg-slate-800/60 hover:bg-slate-800 text-slate-300 border border-slate-700/80 font-semibold py-3 px-4 rounded-xl text-sm transition"
+          >
+            📜 ดูประวัติผลการแข่งขันย้อนหลัง ({matchHistory.length})
+          </button>
+
           {errorMsg && (
             <p className="text-rose-400 text-sm mt-4 bg-rose-950/50 py-2 px-3 rounded-lg border border-rose-800/50">
               {errorMsg}
             </p>
           )}
         </div>
+
+        {/* Modal แสดงประวัติการแข่งขันย้อนหลัง */}
+        {showHistoryModal && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden">
+              <div className="p-4 border-b border-slate-800 flex justify-between items-center">
+                <h2 className="font-bold text-lg text-emerald-400">📜 ประวัติการแข่งขันล่าสุด</h2>
+                <button
+                  onClick={() => setShowHistoryModal(false)}
+                  className="text-slate-400 hover:text-white px-2 py-1"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="p-4 overflow-y-auto space-y-3">
+                {matchHistory.length === 0 ? (
+                  <p className="text-center text-slate-500 py-8">ยังไม่มีประวัติการแข่งขันที่บันทึกไว้</p>
+                ) : (
+                  matchHistory.map((m) => (
+                    <div
+                      key={m.id}
+                      className="bg-slate-950 border border-slate-800/80 rounded-xl p-3.5 flex flex-col gap-1"
+                    >
+                      <div className="flex justify-between items-center text-xs text-slate-500">
+                        <span>ห้อง: {m.room_code}</span>
+                        <span>{new Date(m.finished_at).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                      <div className="flex justify-between items-center font-bold text-base my-1">
+                        <span className={m.p1_frames > m.p2_frames ? 'text-emerald-400' : 'text-slate-300'}>
+                          {m.p1_name}
+                        </span>
+                        <span className="bg-slate-800 px-3 py-0.5 rounded-lg text-amber-400">
+                          {m.p1_frames} - {m.p2_frames}
+                        </span>
+                        <span className={m.p2_frames > m.p1_frames ? 'text-emerald-400' : 'text-slate-300'}>
+                          {m.p2_name}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-400 text-center">
+                        🏆 ผู้ชนะ: <strong className="text-white">{m.winner_name}</strong>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
 
   // ==========================================
-  // หน้าจอที่ 2: Scoreboard หลัก (Real-time)
+  // หน้าจอที่ 2: Scoreboard หลัก
   // ==========================================
   const scoreDiff = Math.abs(room.p1_score - room.p2_score);
 
@@ -333,7 +452,7 @@ export default function App() {
         </button>
 
         <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400">รหัสห้อง:</span>
+          <span className="text-xs text-slate-400">ห้อง:</span>
           <span className="bg-emerald-950 text-emerald-400 border border-emerald-700/50 font-mono font-black px-3 py-1 rounded-lg tracking-widest">
             {room.room_code}
           </span>
@@ -341,11 +460,10 @@ export default function App() {
             onClick={handleCopyLink}
             className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg transition"
           >
-            {copied ? '✅ คัดลอกลิงก์แล้ว!' : '🔗 แชร์ลิงก์'}
+            {copied ? '✅ คัดลอกแล้ว!' : '🔗 แชร์ลิงก์'}
           </button>
         </div>
 
-        {/* ปุ่มสลับโหมดผู้ชม */}
         <button
           onClick={() => setIsSpectator(!isSpectator)}
           className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition ${
@@ -354,7 +472,7 @@ export default function App() {
               : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-white'
           }`}
         >
-          {isSpectator ? '👁️ โหมดผู้ชม (ล็อกปุ่ม)' : '🎮 โหมดคนกดคะแนน'}
+          {isSpectator ? '👁️ โหมดผู้ชม' : '🎮 โหมดคนกดคะแนน'}
         </button>
       </div>
 
@@ -381,7 +499,7 @@ export default function App() {
 
       {/* Main Scoreboard */}
       <main className="w-full max-w-3xl grid grid-cols-2 gap-4 mb-4">
-        {/* Player 1 Card */}
+        {/* Player 1 */}
         <div
           onClick={() => !isSpectator && room.active_player !== 1 && handleSwitchTurn()}
           className={`relative p-5 sm:p-6 rounded-2xl border-2 transition-all flex flex-col items-center justify-between ${
@@ -413,7 +531,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Player 2 Card */}
+        {/* Player 2 */}
         <div
           onClick={() => !isSpectator && room.active_player !== 2 && handleSwitchTurn()}
           className={`relative p-5 sm:p-6 rounded-2xl border-2 transition-all flex flex-col items-center justify-between ${
@@ -447,7 +565,7 @@ export default function App() {
       </main>
 
       {/* Current Break Banner */}
-      <div className="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-xl p-3 mb-6 flex justify-between items-center px-6">
+      <div className="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-xl p-3 mb-5 flex justify-between items-center px-6">
         <span className="text-slate-400 text-sm sm:text-base font-medium">
           Current Break (เบรกไม้ปัจจุบัน)
         </span>
@@ -456,11 +574,10 @@ export default function App() {
         </span>
       </div>
 
-      {/* แสดงปุ่มควบคุมเฉพาะเมื่อไม่ได้อยู่ในโหมดผู้ชม */}
-      {!isSpectator ? (
+      {/* Controls (เฉพาะคนกดคะแนน) */}
+      {!isSpectator && (
         <>
-          {/* Ball Controls */}
-          <section className="w-full max-w-3xl mb-6">
+          <section className="w-full max-w-3xl mb-5">
             <div className="grid grid-cols-4 sm:grid-cols-7 gap-3">
               {BALLS.map((ball) => (
                 <button
@@ -476,8 +593,7 @@ export default function App() {
             </div>
           </section>
 
-          {/* Action & Foul Controls */}
-          <section className="w-full max-w-3xl grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          <section className="w-full max-w-3xl grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-4">
             <button
               onClick={handleSwitchTurn}
               className="col-span-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 px-4 rounded-xl shadow active:scale-95 transition"
@@ -487,23 +603,24 @@ export default function App() {
 
             <button
               onClick={handleUndo}
-              className="bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 active:scale-95 transition"
+              disabled={events.length === 0}
+              className="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 active:scale-95 transition"
             >
               ↩️ Undo
             </button>
 
             <button
-              onClick={handleNextFrame}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3.5 px-4 rounded-xl shadow active:scale-95 transition"
+              onClick={openManualScore}
+              className="bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 active:scale-95 transition"
             >
-              🏆 จบเฟรม (End Frame)
+              ✏️ แก้คะแนนเอง
             </button>
           </section>
 
           {/* Foul Quick Buttons */}
-          <section className="w-full max-w-3xl bg-slate-900/70 border border-slate-800/80 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+          <section className="w-full max-w-3xl bg-slate-900/70 border border-slate-800/80 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 mb-4">
             <span className="text-xs font-semibold text-rose-400 uppercase tracking-wider px-2">
-              ⚠️ ฟาวล์ (บวกแต้มให้อีกฝั่ง):
+              ⚠️ ฟาวล์:
             </span>
             <div className="flex gap-2">
               {[4, 5, 6, 7].map((pts) => (
@@ -517,10 +634,100 @@ export default function App() {
               ))}
             </div>
           </section>
+
+          {/* Frame & Match Finish Controls */}
+          <section className="w-full max-w-3xl grid grid-cols-2 gap-3 mb-6">
+            <button
+              onClick={handleNextFrame}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 px-4 rounded-xl shadow active:scale-95 transition text-sm"
+            >
+              ➕ จบเฟรมนี้ (ขึ้นเฟรมใหม่)
+            </button>
+
+            <button
+              onClick={handleFinishMatch}
+              className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold py-3 px-4 rounded-xl shadow active:scale-95 transition text-sm"
+            >
+              🏆 จบแมตช์ & บันทึกผล
+            </button>
+          </section>
         </>
-      ) : (
-        <div className="w-full max-w-3xl text-center py-6 bg-slate-900/50 border border-slate-800/80 rounded-2xl text-slate-400 text-sm">
-          กำลังรับชมการแข่งขันแบบ Real-time คะแนนจะอัปเดตอัตโนมัติเมื่อผู้บันทึกกดคะแนน
+      )}
+
+      {/* Live Event Log (แสดงทั้งคนกดและผู้ชม) */}
+      <section className="w-full max-w-3xl bg-slate-900/80 border border-slate-800 rounded-2xl p-4">
+        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+          📋 บันทึกการแทงล่าสุด (Live Event Log)
+        </h3>
+        {events.length === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-3">ยังไม่มีรายการบันทึกคะแนนในห้องนี้</p>
+        ) : (
+          <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+            {events.map((ev) => (
+              <div
+                key={ev.id}
+                className="flex justify-between items-center text-xs sm:text-sm bg-slate-950/70 px-3 py-2 rounded-lg border border-slate-800/60"
+              >
+                <span className="text-slate-200">{formatEventText(ev)}</span>
+                <span className="text-slate-500 text-[11px]">
+                  {new Date(ev.created_at).toLocaleTimeString('th-TH', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Modal กรอกคะแนนเอง (Manual Score) */}
+      {showManualModal && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-sm">
+            <h3 className="font-bold text-lg text-amber-400 mb-4 text-center">
+              ✏️ ปรับคะแนนด้วยตนเอง (Manual Score)
+            </h3>
+            <div className="grid grid-cols-2 gap-4 mb-6">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1 text-center truncate">
+                  {room.p1_name}
+                </label>
+                <input
+                  type="number"
+                  value={manualP1}
+                  onChange={(e) => setManualP1(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 text-center text-2xl font-bold focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1 text-center truncate">
+                  {room.p2_name}
+                </label>
+                <input
+                  type="number"
+                  value={manualP2}
+                  onChange={(e) => setManualP2(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl p-3 text-center text-2xl font-bold focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowManualModal(false)}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 py-2.5 rounded-xl text-sm font-semibold"
+              >
+                ยกเลิก
+              </button>
+              <button
+                onClick={handleSaveManualScore}
+                className="flex-1 bg-emerald-600 hover:bg-emerald-500 py-2.5 rounded-xl text-sm font-bold text-white"
+              >
+                บันทึกคะแนน
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
